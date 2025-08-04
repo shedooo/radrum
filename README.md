@@ -16,13 +16,16 @@ A sophisticated yield-bearing vault for Stacks, featuring dynamic strategy alloc
   Automatically rebalances strategies when allocations drift beyond a threshold.
 
 - **Fee Structure:**  
-  Management and performance fees, with high-water mark tracking.
+  Management and performance fees, with high-water mark tracking.  
+  **Now includes:** Owner can update both management and performance fees, and set the treasury address.
 
 - **Gamification:**  
-  Loyalty bonuses, referral codes, and points system (fungible token).
+  Loyalty bonuses, referral codes, and points system (fungible token).  
+  **Now includes:** Users can claim loyalty bonuses, and the owner can manually award referral points.
 
 - **Governance:**  
-  Owner can update allocations, fees, treasury, pause/unpause, and transfer ownership.
+  Owner can update allocations, fees, treasury, pause/unpause, transfer ownership, and accept ownership.  
+  **Now includes:** Two-step ownership transfer (initiate and accept).
 
 - **User Interactions:**  
   Deposit, request withdrawal (with cooldown), execute withdrawal, claim loyalty bonus, and view stats.
@@ -58,8 +61,8 @@ A sophisticated yield-bearing vault for Stacks, featuring dynamic strategy alloc
 - `deposit(amount, min-shares, referral-code)`: Deposit STX, receive shares, earn points, and trigger auto-rebalance if needed.
 - `request-withdrawal(user-shares)`: Request withdrawal (24h cooldown).
 - `execute-withdrawal`: Withdraw STX after cooldown.
-- `claim-loyalty-bonus`: Update loyalty multiplier.
-- `get-user-stats(user)`: View user stats.
+- `claim-loyalty-bonus`: Update loyalty multiplier and claim bonus.
+- `get-user-stats(user)`: View user stats, including shares, achievements, loyalty multiplier, and referrals.
 
 ### Strategy & Yield
 
@@ -78,28 +81,30 @@ A sophisticated yield-bearing vault for Stacks, featuring dynamic strategy alloc
 - `toggle-auto-rebalance`: Enable/disable auto-rebalancing.
 - `set-rebalance-threshold`: Set drift threshold.
 - `pause-vault` / `unpause-vault` / `emergency-shutdown`: Pause or shut down vault.
-- `set-management-fee` / `set-performance-fee`: Update fees.
+- `set-management-fee` / `set-performance-fee`: Update management and performance fees.
 - `set-treasury`: Set treasury address.
-- `transfer-ownership` / `accept-ownership`: Ownership transfer.
+- `transfer-ownership` / `accept-ownership`: Two-step ownership transfer.
 
 ### Gamification
 
 - `create-referral-code(code)`: Create a referral code.
 - `manual-award-referral-points(referrer, amount)`: Owner awards referral points.
+- `claim-loyalty-bonus`: Users can claim their loyalty multiplier as a bonus.
 
 ---
 
 ## Events
 
-Prints events for deposits, withdrawals, rebalances, fee updates, strategy changes, gamification actions, and governance changes.
+Prints events for deposits, withdrawals, rebalances, fee updates, strategy changes, gamification actions, loyalty bonus claims, manual referral point awards, and governance changes (including ownership transfer steps).
 
 ---
 
 ## Usage Notes
 
-- Only the owner can initialize, update risk metrics, optimize allocations, and manage governance.
+- Only the owner can initialize, update risk metrics, optimize allocations, manage governance, and manually award referral points.
 - Deposits and withdrawals are subject to cooldowns, fees, and rebalancing logic.
 - Loyalty and referral bonuses are tracked and can be claimed by users.
+- Ownership transfer is now a two-step process for added security.
 
 ---
 
