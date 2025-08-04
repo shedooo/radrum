@@ -32,6 +32,14 @@
 (define-constant MAX-STRATEGY-ALLOCATION u5000) ;; 50% max per strategy
 (define-constant REBALANCE-THRESHOLD u500) ;; 5% deviation triggers rebalance
 
+;; Input validation constants
+(define-constant MAX-DEPOSIT-AMOUNT u1000000000000) ;; 1M STX max deposit
+(define-constant MAX-APY u10000) ;; 100% max APY
+(define-constant MAX-VOLATILITY u10000) ;; 100% max volatility
+(define-constant MAX-DRAWDOWN u10000) ;; 100% max drawdown
+(define-constant MAX-THRESHOLD u2000) ;; 20% max threshold
+(define-constant MAX-SHARES u1000000000000) ;; Maximum shares that can be requested
+
 ;; ========== GLOBAL STATE ==========
 (define-data-var total-assets uint u0)
 (define-data-var total-shares uint u0)
@@ -125,6 +133,32 @@
 (define-map performance-history 
   {period: uint} 
   {apy: uint, sharpe: uint, max-drawdown: uint, total-return: uint})
+
+;; ========== INPUT VALIDATION HELPERS ==========
+
+(define-private (validate-amount (amount uint))
+  (and (> amount u0) (<= amount MAX-DEPOSIT-AMOUNT)))
+
+(define-private (validate-shares (share-amount uint))
+  (and (> share-amount u0) (<= share-amount MAX-SHARES)))
+
+(define-private (validate-strategy-id (strategy-id uint))
+  (and (>= strategy-id u1) (<= strategy-id u3)))
+
+(define-private (validate-apy (apy uint))
+  (<= apy MAX-APY))
+
+(define-private (validate-volatility (volatility uint))
+  (<= volatility MAX-VOLATILITY))
+
+(define-private (validate-drawdown (drawdown uint))
+  (<= drawdown MAX-DRAWDOWN))
+
+(define-private (validate-threshold (threshold uint))
+  (<= threshold MAX-THRESHOLD))
+
+(define-private (validate-allocation (allocation uint))
+  (<= allocation PRECISION))
 
 ;; ========== HELPER FUNCTIONS ==========
 
@@ -256,28 +290,34 @@
   )
 )
 
-(define-private (award-points (user principal) (amount uint))
-  (let (
-    (current-achievements (get-user-achievements user))
-    (points-to-award (* amount POINTS-PER-STX))
-    (new-points (+ (get points current-achievements) points-to-award))
-    (new-level (calculate-user-level new-points))
-  )
-    (begin
-      ;; Mint points tokens
-      (unwrap! (ft-mint? radrum-points points-to-award user) (err ERR-INVALID-AMOUNT))
-      
-      ;; Update achievements
-      (map-set user-achievements {user: user}
-        (merge current-achievements {
-          points: new-points,
-          level: new-level,
-          total-earned: (+ (get total-earned current-achievements) points-to-award),
-          last-activity: stacks-block-height
-        }))
-      
-      (var-set total-points-issued (+ (var-get total-points-issued) points-to-award))
-      (ok points-to-award)
+(define-private (award-points (user principal) (input-amount uint))
+  (begin
+    ;; Validate amount before using
+    (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
+    
+    (let (
+      (current-achievements (get-user-achievements user))
+      (validated-amount input-amount) ;; Use validated amount consistently
+      (points-to-award (* validated-amount POINTS-PER-STX))
+      (new-points (+ (get points current-achievements) points-to-award))
+      (new-level (calculate-user-level new-points))
+    )
+      (begin
+        ;; Mint points tokens
+        (unwrap! (ft-mint? radrum-points points-to-award user) (err ERR-INVALID-AMOUNT))
+        
+        ;; Update achievements
+        (map-set user-achievements {user: user}
+          (merge current-achievements {
+            points: new-points,
+            level: new-level,
+            total-earned: (+ (get total-earned current-achievements) points-to-award),
+            last-activity: stacks-block-height
+          }))
+        
+        (var-set total-points-issued (+ (var-get total-points-issued) points-to-award))
+        (ok points-to-award)
+      )
     )
   )
 )
@@ -415,11 +455,17 @@
 )
 
 (define-private (deploy-to-specific-strategy (strategy-id uint) (amount uint))
-  (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
-    (begin
-      (map-set strategies {id: strategy-id}
-        (merge strategy {balance: (+ (get balance strategy) amount)}))
-      (ok amount)
+  (begin
+    ;; Validate inputs
+    (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
+    (asserts! (validate-amount amount) (err ERR-INVALID-AMOUNT))
+    
+    (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
+      (begin
+        (map-set strategies {id: strategy-id}
+          (merge strategy {balance: (+ (get balance strategy) amount)}))
+        (ok amount)
+      )
     )
   )
 )
@@ -430,6 +476,11 @@
   (begin
     (asserts! (is-owner) (err ERR-UNAUTHORIZED))
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+    ;; Validate all inputs
+    (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
+    (asserts! (validate-apy apy) (err ERR-INVALID-AMOUNT))
+    (asserts! (validate-volatility volatility) (err ERR-INVALID-AMOUNT))
+    (asserts! (validate-drawdown max-drawdown) (err ERR-INVALID-AMOUNT))
     
     (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
       (let ((sharpe-ratio (if (> volatility u0) (/ (* apy PRECISION) volatility) u0)))
@@ -516,56 +567,67 @@
   )
 )
 
-(define-private (collect-performance-fees (profit uint))
-  (let (
-    (current-share-price (get-share-price))
-    (high-water (var-get high-water-mark))
-  )
-    (if (> current-share-price high-water)
-        (let (
-          (performance-fee-rate (var-get performance-fee))
-          (fee-amount (/ (* profit performance-fee-rate) PRECISION))
-        )
-          (if (> fee-amount u0)
-              (begin
-                ;; Update high water mark
-                (var-set high-water-mark current-share-price)
-                
-                ;; Collect fee by minting shares to treasury
-                (let ((fee-shares (/ (* fee-amount (var-get total-shares)) (var-get total-assets))))
-                  (var-set total-shares (+ (var-get total-shares) fee-shares))
-                  (map-set shares {user: (var-get treasury)} 
-                    {balance: (+ (get balance (get-user-shares (var-get treasury))) fee-shares), 
-                     last-deposit: stacks-block-height,
-                     total-deposited: u0,
-                     deposit-count: u0})
-                )
-                
-                (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
-                (ok fee-amount)
-              )
-              (ok u0)
+(define-private (collect-performance-fees (input-profit uint))
+  (begin
+    ;; Validate profit amount
+    (asserts! (validate-amount input-profit) (err ERR-INVALID-AMOUNT))
+    
+    (let (
+      (current-share-price (get-share-price))
+      (high-water (var-get high-water-mark))
+      (validated-profit input-profit) ;; Use validated profit consistently
+    )
+      (if (> current-share-price high-water)
+          (let (
+            (performance-fee-rate (var-get performance-fee))
+            (fee-amount (/ (* validated-profit performance-fee-rate) PRECISION))
           )
-        )
-        (ok u0)
+            (if (> fee-amount u0)
+                (begin
+                  ;; Update high water mark
+                  (var-set high-water-mark current-share-price)
+                  
+                  ;; Collect fee by minting shares to treasury
+                  (let ((fee-shares (/ (* fee-amount (var-get total-shares)) (var-get total-assets))))
+                    (var-set total-shares (+ (var-get total-shares) fee-shares))
+                    (map-set shares {user: (var-get treasury)} 
+                      {balance: (+ (get balance (get-user-shares (var-get treasury))) fee-shares), 
+                       last-deposit: stacks-block-height,
+                       total-deposited: u0,
+                       deposit-count: u0})
+                  )
+                  
+                  (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
+                  (ok fee-amount)
+                )
+                (ok u0)
+            )
+          )
+          (ok u0)
+      )
     )
   )
 )
 
 (define-private (harvest-strategy (strategy-id uint))
-  (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
-    (let ((yield-amount (get yield strategy)))
-      (if (> yield-amount u0)
-          (begin
-            ;; Reset strategy yield
-            (map-set strategies {id: strategy-id}
-              (merge strategy {yield: u0}))
-            
-            ;; Add yield to total assets
-            (var-set total-assets (+ (var-get total-assets) yield-amount))
-            (ok yield-amount)
-          )
-          (ok u0)
+  (begin
+    ;; Validate strategy ID
+    (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
+    
+    (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
+      (let ((yield-amount (get yield strategy)))
+        (if (> yield-amount u0)
+            (begin
+              ;; Reset strategy yield
+              (map-set strategies {id: strategy-id}
+                (merge strategy {yield: u0}))
+              
+              ;; Add yield to total assets
+              (var-set total-assets (+ (var-get total-assets) yield-amount))
+              (ok yield-amount)
+            )
+            (ok u0)
+        )
       )
     )
   )
@@ -574,76 +636,89 @@
 ;; ========== USER INTERACTIONS ==========
 
 ;; Fixed deposit function with proper error handling
-(define-public (deposit (amount uint) (min-shares uint) (referral-code (optional (string-ascii 20))))
-  (let (
-    (assets (var-get total-assets))
-    (total-shares-supply (var-get total-shares))
-    (share-price (get-share-price))
-    (user-data (get-user-shares tx-sender))
-    (loyalty-multiplier (calculate-loyalty-multiplier tx-sender))
-    (mint-shares (if (is-eq total-shares-supply u0)
-                     amount
-                     (/ (* amount PRECISION) share-price)))
-    (bonus-shares (/ (* mint-shares (- loyalty-multiplier PRECISION)) PRECISION))
-  )
-    (begin
-  (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
-  (asserts! (not-paused) (err ERR-VAULT-PAUSED))
-  (asserts! (not (var-get emergency-shutdown-flag)) (err ERR-VAULT-PAUSED))
-  (asserts! (> amount u0) (err ERR-NO-FUNDS))
-  (asserts! (>= (+ mint-shares bonus-shares) min-shares) (err ERR-SLIPPAGE-TOO-HIGH))
-  
-  ;; Process referral if provided (tracks referrals without point rewards)
-  (unwrap-panic (process-referral referral-code))
-  
-  ;; Collect management fees before deposit
-  (try! (collect-management-fees))
-  
-  ;; Transfer STX to vault
-  (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-  
-  ;; Award gamification points to depositor
-  (try! (award-points tx-sender amount))
-  
-  ;; Update user shares with enhanced tracking
-  (map-set shares {user: tx-sender} 
-    {balance: (+ (get balance user-data) mint-shares bonus-shares), 
-     last-deposit: stacks-block-height,
-     total-deposited: (+ (get total-deposited user-data) amount),
-     deposit-count: (+ (get deposit-count user-data) u1)})
-  
-  ;; Update vault state
-  (var-set total-assets (+ assets amount))
-  (var-set total-shares (+ total-shares-supply mint-shares bonus-shares))
-  
-  ;; Auto-rebalance if enabled and needed - properly handle the response
-  (let ((should-rebalance (and (var-get auto-rebalance-enabled) (needs-rebalancing))))
-    (unwrap-panic (if should-rebalance
-        (begin 
-            (unwrap! (rebalance-strategies) (err ERR-REBALANCE-NOT-NEEDED))
-            (ok true))
-        (begin
-            (unwrap! (deploy-to-all-strategies) (err ERR-STRATEGY-NOT-FOUND))
-            (ok true)))))
-  
-  (print {event: "deposit", user: tx-sender, amount: amount, shares: (+ mint-shares bonus-shares), bonus: bonus-shares})
-  (ok (+ mint-shares bonus-shares))
-)
+(define-public (deposit (input-amount uint) (input-min-shares uint) (referral-code (optional (string-ascii 20))))
+  (begin
+    ;; Validate inputs first
+    (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
+    (asserts! (validate-shares input-min-shares) (err ERR-INVALID-AMOUNT))
+    (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+    (asserts! (not-paused) (err ERR-VAULT-PAUSED))
+    (asserts! (not (var-get emergency-shutdown-flag)) (err ERR-VAULT-PAUSED))
+    
+    (let (
+      (assets (var-get total-assets))
+      (total-shares-supply (var-get total-shares))
+      (share-price (get-share-price))
+      (user-data (get-user-shares tx-sender))
+      (loyalty-multiplier (calculate-loyalty-multiplier tx-sender))
+      (validated-amount input-amount) ;; Use validated amount consistently
+      (validated-min-shares input-min-shares) ;; Use validated min-shares consistently
+      (mint-shares (if (is-eq total-shares-supply u0)
+                       validated-amount
+                       (/ (* validated-amount PRECISION) share-price)))
+      (bonus-shares (/ (* mint-shares (- loyalty-multiplier PRECISION)) PRECISION))
+    )
+      (begin
+        (asserts! (>= (+ mint-shares bonus-shares) validated-min-shares) (err ERR-SLIPPAGE-TOO-HIGH))
+        
+        ;; Process referral if provided (tracks referrals without point rewards)
+        (unwrap-panic (process-referral referral-code))
+        
+        ;; Collect management fees before deposit
+        (try! (collect-management-fees))
+        
+        ;; Transfer STX to vault
+        (try! (stx-transfer? validated-amount tx-sender (as-contract tx-sender)))
+        
+        ;; Award gamification points to depositor
+        (try! (award-points tx-sender validated-amount))
+        
+        ;; Update user shares with enhanced tracking
+        (map-set shares {user: tx-sender} 
+          {balance: (+ (get balance user-data) mint-shares bonus-shares), 
+           last-deposit: stacks-block-height,
+           total-deposited: (+ (get total-deposited user-data) validated-amount),
+           deposit-count: (+ (get deposit-count user-data) u1)})
+        
+        ;; Update vault state
+        (var-set total-assets (+ assets validated-amount))
+        (var-set total-shares (+ total-shares-supply mint-shares bonus-shares))
+        
+        ;; Auto-rebalance if enabled and needed - properly handle the response
+        (let ((should-rebalance (and (var-get auto-rebalance-enabled) (needs-rebalancing))))
+          (unwrap-panic (if should-rebalance
+              (begin 
+                  (unwrap! (rebalance-strategies) (err ERR-REBALANCE-NOT-NEEDED))
+                  (ok true))
+              (begin
+                  (unwrap! (deploy-to-all-strategies) (err ERR-STRATEGY-NOT-FOUND))
+                  (ok true)))))
+        
+        (print {event: "deposit", user: tx-sender, amount: validated-amount, shares: (+ mint-shares bonus-shares), bonus: bonus-shares})
+        (ok (+ mint-shares bonus-shares))
+      )
+    )
   )
 )
 
-(define-public (request-withdrawal (user-shares uint))
-  (let ((user-balance (get-user-shares tx-sender)))
-    (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
-    (asserts! (not-emergency) (err ERR-VAULT-PAUSED))
-    (asserts! (<= user-shares (get balance user-balance)) (err ERR-NO-SHARES))
+(define-public (request-withdrawal (input-user-shares uint))
+  (begin
+    ;; Validate input
+    (asserts! (validate-shares input-user-shares) (err ERR-INVALID-AMOUNT))
     
-    ;; Set withdrawal request with cooldown
-    (map-set withdrawal-requests {user: tx-sender} 
-      {amount: user-shares, timestamp: (+ stacks-block-height u144)}) ;; ~24 hour cooldown
-    
-    (print {event: "withdrawal-requested", user: tx-sender, shares: user-shares})
-    (ok true)
+    (let ((user-balance (get-user-shares tx-sender))
+          (validated-shares input-user-shares)) ;; Use validated shares consistently
+      (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+      (asserts! (not-emergency) (err ERR-VAULT-PAUSED))
+      (asserts! (<= validated-shares (get balance user-balance)) (err ERR-NO-SHARES))
+      
+      ;; Set withdrawal request with cooldown
+      (map-set withdrawal-requests {user: tx-sender} 
+        {amount: validated-shares, timestamp: (+ stacks-block-height u144)}) ;; ~24 hour cooldown
+      
+      (print {event: "withdrawal-requested", user: tx-sender, shares: validated-shares})
+      (ok true)
+    )
   )
 )
 
@@ -665,6 +740,9 @@
     
     ;; Calculate withdrawal amount
     (let ((withdrawal-amount (/ (* user-shares assets) total-shares-supply)))
+      ;; Validate withdrawal amount
+      (asserts! (validate-amount withdrawal-amount) (err ERR-INVALID-AMOUNT))
+      
       ;; Ensure vault has enough liquid assets
       (if (> withdrawal-amount assets)
     (unwrap-panic (withdraw-all-from-strategies))
@@ -692,18 +770,22 @@
 
 ;; ========== YIELD MANAGEMENT ==========
 
-(define-public (simulate-yield (strategy-id uint) (amount uint))
+(define-public (simulate-yield (strategy-id uint) (input-amount uint))
   (begin
     (asserts! (is-owner) (err ERR-UNAUTHORIZED))
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+    ;; Validate inputs
+    (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
+    (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
     
-    (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
+    (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND)))
+          (validated-amount input-amount)) ;; Use validated amount consistently
       (begin
         (map-set strategies {id: strategy-id}
-          (merge strategy {yield: (+ (get yield strategy) amount)}))
+          (merge strategy {yield: (+ (get yield strategy) validated-amount)}))
         
-        (print {event: "yield-simulated", strategy: strategy-id, amount: amount})
-        (ok amount)
+        (print {event: "yield-simulated", strategy: strategy-id, amount: validated-amount})
+        (ok validated-amount)
       )
     )
   )
@@ -745,7 +827,9 @@
   (begin
     (asserts! (is-owner) (err ERR-UNAUTHORIZED))
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
-    (asserts! (<= target-weight PRECISION) (err ERR-INVALID-ALLOCATION))
+    ;; Validate inputs
+    (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
+    (asserts! (validate-allocation target-weight) (err ERR-INVALID-ALLOCATION))
     (asserts! (<= max-allocation MAX-STRATEGY-ALLOCATION) (err ERR-INVALID-ALLOCATION))
     
     (let ((current-allocation (default-to {target-weight: u0, current-weight: u0, max-allocation: u0} 
@@ -771,7 +855,8 @@
 (define-public (set-rebalance-threshold (threshold uint))
   (begin
     (asserts! (is-owner) (err ERR-UNAUTHORIZED))
-    (asserts! (<= threshold u2000) (err ERR-INVALID-AMOUNT)) ;; Max 20% threshold
+    ;; Validate threshold input
+    (asserts! (validate-threshold threshold) (err ERR-INVALID-AMOUNT))
     (var-set rebalance-threshold threshold)
     (print {event: "rebalance-threshold-updated", threshold: threshold})
     (ok true)
@@ -887,14 +972,18 @@
 ;; ========== MANUAL REFERRAL POINT AWARDING (OPTIONAL) ==========
 
 ;; Owner can manually award referral points if needed
-(define-public (manual-award-referral-points (referrer principal) (amount uint))
+(define-public (manual-award-referral-points (referrer principal) (input-amount uint))
   (begin
     (asserts! (is-owner) (err ERR-UNAUTHORIZED))
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+    ;; Validate amount input
+    (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
     
-    (try! (award-points referrer amount))
-    
-    (print {event: "manual-referral-points-awarded", referrer: referrer, amount: amount})
-    (ok amount)
+    (let ((validated-amount input-amount)) ;; Use validated amount consistently
+      (try! (award-points referrer validated-amount))
+      
+      (print {event: "manual-referral-points-awarded", referrer: referrer, amount: validated-amount})
+      (ok validated-amount)
+    )
   )
 )
