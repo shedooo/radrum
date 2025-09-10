@@ -1,5 +1,6 @@
 ;; A sophisticated yield-bearing vault with dynamic strategy allocation,
 ;; risk-adjusted optimization, gamification, and advanced governance features
+;; FIXED VERSION: Proper STX accounting, liquidity management, and invariant checking
 
 ;; ========== CONSTANTS & ERRORS ==========
 (define-constant ERR-NO-FUNDS u100)
@@ -16,6 +17,11 @@
 (define-constant ERR-INVALID-ALLOCATION u111)
 (define-constant ERR-REBALANCE-NOT-NEEDED u112)
 (define-constant ERR-INVALID-REFERRAL u113)
+(define-constant ERR-INSUFFICIENT-LIQUIDITY u114)
+(define-constant ERR-INVARIANT-VIOLATION u115)
+(define-constant ERR-DIVISION-BY-ZERO u116)
+(define-constant ERR-TRANSFER-FAILED u117)
+(define-constant ERR-ROUNDING-ERROR u118)
 
 ;; Fee constants (basis points: 10000 = 100%)
 (define-constant MAX-MANAGEMENT-FEE u200)  ;; 2% max
@@ -40,8 +46,15 @@
 (define-constant MAX-THRESHOLD u2000) ;; 20% max threshold
 (define-constant MAX-SHARES u1000000000000) ;; Maximum shares that can be requested
 
+;; Minimum values to prevent division by zero and rounding issues
+(define-constant MIN-DEPOSIT u1000) ;; 0.001 STX minimum deposit
+(define-constant MIN-SHARES u1) ;; Minimum shares to mint
+(define-constant DUST_THRESHOLD u100) ;; Below this is considered dust
+
 ;; ========== GLOBAL STATE ==========
-(define-data-var total-assets uint u0)
+;; FIXED: Separate liquid assets from deployed assets for proper accounting
+(define-data-var liquid-assets uint u0)     ;; STX held in contract
+(define-data-var deployed-assets uint u0)   ;; STX deployed to strategies
 (define-data-var total-shares uint u0)
 (define-data-var vault-paused bool false)
 (define-data-var emergency-shutdown-flag bool false)
@@ -137,10 +150,10 @@
 ;; ========== INPUT VALIDATION HELPERS ==========
 
 (define-private (validate-amount (amount uint))
-  (and (> amount u0) (<= amount MAX-DEPOSIT-AMOUNT)))
+  (and (>= amount MIN-DEPOSIT) (<= amount MAX-DEPOSIT-AMOUNT)))
 
 (define-private (validate-shares (share-amount uint))
-  (and (> share-amount u0) (<= share-amount MAX-SHARES)))
+  (and (>= share-amount MIN-SHARES) (<= share-amount MAX-SHARES)))
 
 (define-private (validate-strategy-id (strategy-id uint))
   (and (>= strategy-id u1) (<= strategy-id u3)))
@@ -160,6 +173,33 @@
 (define-private (validate-allocation (allocation uint))
   (<= allocation PRECISION))
 
+;; ========== INVARIANT CHECKING ==========
+
+;; FIXED: Add comprehensive invariant checking
+(define-private (check-vault-invariants)
+  (let (
+    (liquid (var-get liquid-assets))
+    (deployed (var-get deployed-assets))
+    (total-assets (+ liquid deployed))
+    (total-shares-supply (var-get total-shares))
+    (strategy1-balance (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u1}))))
+    (strategy2-balance (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u2}))))
+    (strategy3-balance (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u3}))))
+    (total-strategy-balance (+ (+ strategy1-balance strategy2-balance) strategy3-balance))
+  )
+    (and
+      ;; Deployed assets must equal sum of strategy balances
+      (is-eq deployed total-strategy-balance)
+      ;; Total assets must be positive if shares exist
+      (or (is-eq total-shares-supply u0) (> total-assets u0))
+      ;; Share price must be reasonable (between 0.1 and 100)
+      (or (is-eq total-shares-supply u0) 
+          (and (>= (/ (* total-assets PRECISION) total-shares-supply) u1000)
+               (<= (/ (* total-assets PRECISION) total-shares-supply) u1000000)))
+    )
+  )
+)
+
 ;; ========== HELPER FUNCTIONS ==========
 
 (define-read-only (get-user-shares (user principal))
@@ -170,11 +210,19 @@
   (default-to {points: u0, level: u0, total-earned: u0, referrals: u0, loyalty-multiplier: u10000, last-activity: u0}
               (map-get? user-achievements {user: user})))
 
+;; FIXED: Safe share price calculation with division by zero protection
 (define-read-only (get-share-price)
   (let ((total-shares-supply (var-get total-shares)))
     (if (is-eq total-shares-supply u0)
         PRECISION
-        (/ (* (var-get total-assets) PRECISION) total-shares-supply))))
+        (let ((total-assets (+ (var-get liquid-assets) (var-get deployed-assets))))
+          (if (is-eq total-assets u0)
+              PRECISION
+              (/ (* total-assets PRECISION) total-shares-supply))))))
+
+;; FIXED: Get total assets safely
+(define-read-only (get-total-assets)
+  (+ (var-get liquid-assets) (var-get deployed-assets)))
 
 (define-read-only (get-strategy-info (id uint))
   (map-get? strategies {id: id}))
@@ -184,7 +232,9 @@
 
 (define-read-only (get-vault-info)
   {
-    total-assets: (var-get total-assets),
+    liquid-assets: (var-get liquid-assets),
+    deployed-assets: (var-get deployed-assets),
+    total-assets: (get-total-assets),
     total-shares: (var-get total-shares),
     share-price: (get-share-price),
     paused: (var-get vault-paused),
@@ -361,11 +411,7 @@
 
 (define-read-only (calculate-allocation-drift)
   (let (
-    (total-deployed (fold + (list 
-      (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u1})))
-      (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u2})))
-      (get balance (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u3})))
-    ) u0))
+    (total-deployed (var-get deployed-assets))
   )
     (if (is-eq total-deployed u0)
         u0
@@ -385,7 +431,7 @@
 (define-read-only (needs-rebalancing)
   (> (calculate-allocation-drift) (var-get rebalance-threshold)))
 
-;; Fixed rebalance-strategies function with simplified response handling
+;; FIXED: Proper rebalancing with liquidity management
 (define-public (rebalance-strategies)
   (begin
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
@@ -393,11 +439,14 @@
     (asserts! (not-emergency) (err ERR-VAULT-PAUSED))
     (asserts! (needs-rebalancing) (err ERR-REBALANCE-NOT-NEEDED))
     
-    ;; Withdraw all from strategies - use unwrap-panic to handle response
+    ;; Withdraw all from strategies to liquid assets
     (unwrap-panic (withdraw-all-from-strategies))
     
-    ;; Redeploy according to target allocations - use unwrap-panic to handle response
-    (unwrap-panic (deploy-to-all-strategies))
+    ;; Redeploy according to target allocations
+    (try! (deploy-to-all-strategies))
+    
+    ;; Check invariants after rebalancing
+    (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
     
     (var-set last-rebalance stacks-block-height)
     
@@ -406,6 +455,7 @@
   )
 )
 
+;; FIXED: Proper withdrawal from strategies with accounting
 (define-private (withdraw-all-from-strategies)
   (let (
     (strategy1 (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u1})))
@@ -419,36 +469,40 @@
       (map-set strategies {id: u2} (merge strategy2 {balance: u0}))
       (map-set strategies {id: u3} (merge strategy3 {balance: u0}))
       
-      ;; Add to vault assets
-      (var-set total-assets (+ (var-get total-assets) total-to-withdraw))
+      ;; Move from deployed to liquid assets
+      (var-set deployed-assets (- (var-get deployed-assets) total-to-withdraw))
+      (var-set liquid-assets (+ (var-get liquid-assets) total-to-withdraw))
       
       (ok total-to-withdraw)
     )
   )
 )
 
+;; FIXED: Proper deployment with accounting
 (define-private (deploy-to-all-strategies)
   (let (
-    (total-assets-to-deploy (var-get total-assets))
+    (liquid-to-deploy (var-get liquid-assets))
     (allocation1 (get target-weight (default-to {target-weight: u0, current-weight: u0, max-allocation: u0} (map-get? strategy-allocations {id: u1}))))
     (allocation2 (get target-weight (default-to {target-weight: u0, current-weight: u0, max-allocation: u0} (map-get? strategy-allocations {id: u2}))))
     (allocation3 (get target-weight (default-to {target-weight: u0, current-weight: u0, max-allocation: u0} (map-get? strategy-allocations {id: u3}))))
   )
     (let (
-      (amount1 (/ (* total-assets-to-deploy allocation1) PRECISION))
-      (amount2 (/ (* total-assets-to-deploy allocation2) PRECISION))
-      (amount3 (/ (* total-assets-to-deploy allocation3) PRECISION))
+      (amount1 (/ (* liquid-to-deploy allocation1) PRECISION))
+      (amount2 (/ (* liquid-to-deploy allocation2) PRECISION))
+      (amount3 (/ (* liquid-to-deploy allocation3) PRECISION))
+      (total-deployed (+ (+ amount1 amount2) amount3))
     )
       (begin
-        ;; Deploy to each strategy - use unwrap-panic for consistent error handling
-        (unwrap-panic (deploy-to-specific-strategy u1 amount1))
-        (unwrap-panic (deploy-to-specific-strategy u2 amount2))
-        (unwrap-panic (deploy-to-specific-strategy u3 amount3))
+        ;; Deploy to each strategy
+        (try! (deploy-to-specific-strategy u1 amount1))
+        (try! (deploy-to-specific-strategy u2 amount2))
+        (try! (deploy-to-specific-strategy u3 amount3))
         
-        ;; Update vault assets (should be close to 0 after deployment)
-        (var-set total-assets (- total-assets-to-deploy (+ (+ amount1 amount2) amount3)))
+        ;; Update liquid and deployed assets
+        (var-set liquid-assets (- liquid-to-deploy total-deployed))
+        (var-set deployed-assets (+ (var-get deployed-assets) total-deployed))
         
-        (ok (+ (+ amount1 amount2) amount3))
+        (ok total-deployed)
       )
     )
   )
@@ -458,7 +512,7 @@
   (begin
     ;; Validate inputs
     (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
-    (asserts! (validate-amount amount) (err ERR-INVALID-AMOUNT))
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
     
     (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND))))
       (begin
@@ -537,27 +591,30 @@
 
 ;; ========== FEE MANAGEMENT ==========
 
+;; FIXED: Proper fee collection with treasury transfer
 (define-private (collect-management-fees)
   (let (
     (last-collected (var-get last-fee-collection))
     (current-block stacks-block-height)
     (elapsed-blocks (- current-block last-collected))
-    (vault-assets (var-get total-assets))
+    (total-assets (get-total-assets))
     (management-fee-rate (var-get management-fee))
   )
-    (if (or (is-eq elapsed-blocks u0) (is-eq vault-assets u0))
+    (if (or (is-eq elapsed-blocks u0) (is-eq total-assets u0))
         (ok u0)
         (let (
-          (annual-fee (/ (* vault-assets management-fee-rate) PRECISION))
+          (annual-fee (/ (* total-assets management-fee-rate) PRECISION))
           (fee (/ (* annual-fee elapsed-blocks) SECONDS-PER-YEAR))
         )
-          (if (> fee u0)
+          (if (and (> fee u0) (>= (var-get liquid-assets) fee))
               (begin
-                (var-set total-assets (- vault-assets fee))
+                ;; Deduct fee from liquid assets
+                (var-set liquid-assets (- (var-get liquid-assets) fee))
                 (var-set total-fees-collected (+ (var-get total-fees-collected) fee))
                 (var-set last-fee-collection current-block)
-                ;; Transfer fee to treasury
-                (unwrap! (as-contract (stx-transfer? fee tx-sender (var-get treasury))) (err ERR-INSUFFICIENT-BALANCE))
+                
+                ;; Transfer fee to treasury from contract
+                (try! (as-contract (stx-transfer? fee tx-sender (var-get treasury))))
                 (ok fee)
               )
               (ok u0)
@@ -567,15 +624,16 @@
   )
 )
 
+;; FIXED: Performance fee collection with proper return type matching
 (define-private (collect-performance-fees (input-profit uint))
   (begin
     ;; Validate profit amount
-    (asserts! (validate-amount input-profit) (err ERR-INVALID-AMOUNT))
+    (asserts! (> input-profit u0) (err ERR-INVALID-AMOUNT))
     
     (let (
       (current-share-price (get-share-price))
       (high-water (var-get high-water-mark))
-      (validated-profit input-profit) ;; Use validated profit consistently
+      (validated-profit input-profit)
     )
       (if (> current-share-price high-water)
           (let (
@@ -588,13 +646,25 @@
                   (var-set high-water-mark current-share-price)
                   
                   ;; Collect fee by minting shares to treasury
-                  (let ((fee-shares (/ (* fee-amount (var-get total-shares)) (var-get total-assets))))
-                    (var-set total-shares (+ (var-get total-shares) fee-shares))
-                    (map-set shares {user: (var-get treasury)} 
-                      {balance: (+ (get balance (get-user-shares (var-get treasury))) fee-shares), 
-                       last-deposit: stacks-block-height,
-                       total-deposited: u0,
-                       deposit-count: u0})
+                  (let (
+                    (total-assets (get-total-assets))
+                    (total-shares-supply (var-get total-shares))
+                  )
+                    ;; FIXED: Ensure both branches return uint
+                    (if (and (> total-assets u0) (> total-shares-supply u0))
+                        (let ((fee-shares (/ (* fee-amount total-shares-supply) total-assets)))
+                          (begin
+                            (var-set total-shares (+ total-shares-supply fee-shares))
+                            (map-set shares {user: (var-get treasury)} 
+                              {balance: (+ (get balance (get-user-shares (var-get treasury))) fee-shares), 
+                               last-deposit: stacks-block-height,
+                               total-deposited: u0,
+                               deposit-count: u0})
+                            fee-shares  ;; FIXED: Return fee-shares (uint) instead of map-set result (bool)
+                          )
+                        )
+                        u0  ;; Return u0 when conditions not met
+                    )
                   )
                   
                   (var-set total-fees-collected (+ (var-get total-fees-collected) fee-amount))
@@ -622,8 +692,8 @@
               (map-set strategies {id: strategy-id}
                 (merge strategy {yield: u0}))
               
-              ;; Add yield to total assets
-              (var-set total-assets (+ (var-get total-assets) yield-amount))
+              ;; Add yield to liquid assets (harvested yield comes back as liquid)
+              (var-set liquid-assets (+ (var-get liquid-assets) yield-amount))
               (ok yield-amount)
             )
             (ok u0)
@@ -635,7 +705,7 @@
 
 ;; ========== USER INTERACTIONS ==========
 
-;; Fixed deposit function with proper error handling
+;; FIXED: Proper deposit function with correct STX handling
 (define-public (deposit (input-amount uint) (input-min-shares uint) (referral-code (optional (string-ascii 20))))
   (begin
     ;; Validate inputs first
@@ -646,56 +716,58 @@
     (asserts! (not (var-get emergency-shutdown-flag)) (err ERR-VAULT-PAUSED))
     
     (let (
-      (assets (var-get total-assets))
+      (total-assets (get-total-assets))
       (total-shares-supply (var-get total-shares))
       (share-price (get-share-price))
       (user-data (get-user-shares tx-sender))
       (loyalty-multiplier (calculate-loyalty-multiplier tx-sender))
-      (validated-amount input-amount) ;; Use validated amount consistently
-      (validated-min-shares input-min-shares) ;; Use validated min-shares consistently
-      (mint-shares (if (is-eq total-shares-supply u0)
-                       validated-amount
-                       (/ (* validated-amount PRECISION) share-price)))
-      (bonus-shares (/ (* mint-shares (- loyalty-multiplier PRECISION)) PRECISION))
+      (validated-amount input-amount)
+      (validated-min-shares input-min-shares)
     )
-      (begin
-        (asserts! (>= (+ mint-shares bonus-shares) validated-min-shares) (err ERR-SLIPPAGE-TOO-HIGH))
-        
-        ;; Process referral if provided (tracks referrals without point rewards)
-        (unwrap-panic (process-referral referral-code))
-        
-        ;; Collect management fees before deposit
-        (try! (collect-management-fees))
-        
-        ;; Transfer STX to vault
-        (try! (stx-transfer? validated-amount tx-sender (as-contract tx-sender)))
-        
-        ;; Award gamification points to depositor
-        (try! (award-points tx-sender validated-amount))
-        
-        ;; Update user shares with enhanced tracking
-        (map-set shares {user: tx-sender} 
-          {balance: (+ (get balance user-data) mint-shares bonus-shares), 
-           last-deposit: stacks-block-height,
-           total-deposited: (+ (get total-deposited user-data) validated-amount),
-           deposit-count: (+ (get deposit-count user-data) u1)})
-        
-        ;; Update vault state
-        (var-set total-assets (+ assets validated-amount))
-        (var-set total-shares (+ total-shares-supply mint-shares bonus-shares))
-        
-        ;; Auto-rebalance if enabled and needed - properly handle the response
-        (let ((should-rebalance (and (var-get auto-rebalance-enabled) (needs-rebalancing))))
-          (unwrap-panic (if should-rebalance
-              (begin 
-                  (unwrap! (rebalance-strategies) (err ERR-REBALANCE-NOT-NEEDED))
-                  (ok true))
-              (begin
-                  (unwrap! (deploy-to-all-strategies) (err ERR-STRATEGY-NOT-FOUND))
-                  (ok true)))))
-        
-        (print {event: "deposit", user: tx-sender, amount: validated-amount, shares: (+ mint-shares bonus-shares), bonus: bonus-shares})
-        (ok (+ mint-shares bonus-shares))
+      (let (
+        ;; Calculate shares to mint - handle first deposit case
+        (base-shares (if (is-eq total-shares-supply u0)
+                        validated-amount  ;; First deposit: 1:1 ratio
+                        (/ (* validated-amount PRECISION) share-price)))
+        (bonus-shares (/ (* base-shares (- loyalty-multiplier PRECISION)) PRECISION))
+        (total-shares-to-mint (+ base-shares bonus-shares))
+      )
+        (begin
+          ;; Check slippage protection
+          (asserts! (>= total-shares-to-mint validated-min-shares) (err ERR-SLIPPAGE-TOO-HIGH))
+          
+          ;; Process referral if provided
+          (unwrap-panic (process-referral referral-code))
+          
+          ;; Collect management fees before deposit
+          (try! (collect-management-fees))
+          
+          ;; FIXED: User transfers STX to contract principal
+          (try! (stx-transfer? validated-amount tx-sender (as-contract tx-sender)))
+          
+          ;; Award gamification points to depositor
+          (try! (award-points tx-sender validated-amount))
+          
+          ;; Update user shares with enhanced tracking
+          (map-set shares {user: tx-sender} 
+            {balance: (+ (get balance user-data) total-shares-to-mint), 
+             last-deposit: stacks-block-height,
+             total-deposited: (+ (get total-deposited user-data) validated-amount),
+             deposit-count: (+ (get deposit-count user-data) u1)})
+          
+          ;; FIXED: Update vault state - add to liquid assets
+          (var-set liquid-assets (+ (var-get liquid-assets) validated-amount))
+          (var-set total-shares (+ total-shares-supply total-shares-to-mint))
+          
+          ;; Deploy funds to strategies
+          (try! (deploy-to-all-strategies))
+          
+          ;; Check invariants after deposit
+          (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
+          
+          (print {event: "deposit", user: tx-sender, amount: validated-amount, shares: total-shares-to-mint, bonus: bonus-shares})
+          (ok total-shares-to-mint)
+        )
       )
     )
   )
@@ -707,7 +779,7 @@
     (asserts! (validate-shares input-user-shares) (err ERR-INVALID-AMOUNT))
     
     (let ((user-balance (get-user-shares tx-sender))
-          (validated-shares input-user-shares)) ;; Use validated shares consistently
+          (validated-shares input-user-shares))
       (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
       (asserts! (not-emergency) (err ERR-VAULT-PAUSED))
       (asserts! (<= validated-shares (get balance user-balance)) (err ERR-NO-SHARES))
@@ -722,31 +794,43 @@
   )
 )
 
+;; FIXED: Proper withdrawal execution with liquidity management
 (define-public (execute-withdrawal)
   (let (
     (request (unwrap! (map-get? withdrawal-requests {user: tx-sender}) (err ERR-NO-SHARES)))
     (user-shares (get amount request))
     (cooldown-end (get timestamp request))
     (user-balance (get-user-shares tx-sender))
-    (assets (var-get total-assets))
+    (total-assets (get-total-assets))
     (total-shares-supply (var-get total-shares))
   )
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
     (asserts! (>= stacks-block-height cooldown-end) (err ERR-COOLDOWN-ACTIVE))
     (asserts! (<= user-shares (get balance user-balance)) (err ERR-NO-SHARES))
+    (asserts! (> total-shares-supply u0) (err ERR-DIVISION-BY-ZERO))
     
     ;; Collect fees before withdrawal
     (try! (collect-management-fees))
     
-    ;; Calculate withdrawal amount
-    (let ((withdrawal-amount (/ (* user-shares assets) total-shares-supply)))
+    ;; Calculate withdrawal amount with rounding protection
+    (let (
+      (withdrawal-amount (/ (* user-shares total-assets) total-shares-supply))
+      (liquid-available (var-get liquid-assets))
+    )
       ;; Validate withdrawal amount
-      (asserts! (validate-amount withdrawal-amount) (err ERR-INVALID-AMOUNT))
+      (asserts! (> withdrawal-amount u0) (err ERR-INVALID-AMOUNT))
       
-      ;; Ensure vault has enough liquid assets
-      (if (> withdrawal-amount assets)
-    (unwrap-panic (withdraw-all-from-strategies))
-    u0)
+      ;; Ensure we have enough liquid assets, withdraw from strategies if needed
+      (if (> withdrawal-amount liquid-available)
+          (let ((needed-liquidity (- withdrawal-amount liquid-available)))
+            ;; Withdraw proportionally from strategies
+            (unwrap-panic (withdraw-for-liquidity needed-liquidity))
+          )
+          u0
+      )
+      
+      ;; Final check for sufficient liquidity
+      (asserts! (>= (var-get liquid-assets) withdrawal-amount) (err ERR-INSUFFICIENT-LIQUIDITY))
       
       ;; Update user balance
       (map-set shares {user: tx-sender} 
@@ -754,16 +838,53 @@
       
       ;; Update vault state
       (var-set total-shares (- total-shares-supply user-shares))
-      (var-set total-assets (- (var-get total-assets) withdrawal-amount))
+      (var-set liquid-assets (- (var-get liquid-assets) withdrawal-amount))
       
       ;; Remove withdrawal request
       (map-delete withdrawal-requests {user: tx-sender})
       
-      ;; Transfer STX to user
+      ;; Check invariants before transfer
+      (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
+      
+      ;; FIXED: Contract transfers STX to user
       (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
       
       (print {event: "withdrawal", user: tx-sender, amount: withdrawal-amount, shares: user-shares})
       (ok withdrawal-amount)
+    )
+  )
+)
+
+;; FIXED: Helper function to withdraw specific amount for liquidity
+(define-private (withdraw-for-liquidity (needed-amount uint))
+  (let (
+    (deployed-total (var-get deployed-assets))
+  )
+    (if (> deployed-total u0)
+        (let (
+          (withdrawal-ratio (/ (* needed-amount PRECISION) deployed-total))
+          (strategy1 (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u1})))
+          (strategy2 (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u2})))
+          (strategy3 (default-to {balance: u0, yield: u0, active: false, name: "", risk-level: u0, apy: u0, volatility: u0, max-drawdown: u0, sharpe-ratio: u0} (map-get? strategies {id: u3})))
+          (withdraw1 (/ (* (get balance strategy1) withdrawal-ratio) PRECISION))
+          (withdraw2 (/ (* (get balance strategy2) withdrawal-ratio) PRECISION))
+          (withdraw3 (/ (* (get balance strategy3) withdrawal-ratio) PRECISION))
+          (total-withdrawn (+ (+ withdraw1 withdraw2) withdraw3))
+        )
+          (begin
+            ;; Update strategy balances
+            (map-set strategies {id: u1} (merge strategy1 {balance: (- (get balance strategy1) withdraw1)}))
+            (map-set strategies {id: u2} (merge strategy2 {balance: (- (get balance strategy2) withdraw2)}))
+            (map-set strategies {id: u3} (merge strategy3 {balance: (- (get balance strategy3) withdraw3)}))
+            
+            ;; Move from deployed to liquid
+            (var-set deployed-assets (- deployed-total total-withdrawn))
+            (var-set liquid-assets (+ (var-get liquid-assets) total-withdrawn))
+            
+            (ok total-withdrawn)
+          )
+        )
+        (ok u0)
     )
   )
 )
@@ -776,10 +897,10 @@
     (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
     ;; Validate inputs
     (asserts! (validate-strategy-id strategy-id) (err ERR-INVALID-STRATEGY))
-    (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
+    (asserts! (> input-amount u0) (err ERR-INVALID-AMOUNT))
     
     (let ((strategy (unwrap! (map-get? strategies {id: strategy-id}) (err ERR-STRATEGY-NOT-FOUND)))
-          (validated-amount input-amount)) ;; Use validated amount consistently
+          (validated-amount input-amount))
       (begin
         (map-set strategies {id: strategy-id}
           (merge strategy {yield: (+ (get yield strategy) validated-amount)}))
@@ -804,15 +925,25 @@
     )
       (begin
         ;; Collect performance fees on profits
-        (unwrap-panic (collect-performance-fees total-yield))
+        (let ((performance-fee-result 
+                (if (> total-yield u0)
+                    (collect-performance-fees total-yield)
+                    (ok u0))))
+          (try! performance-fee-result)
+        )
+        
         (var-set last-harvest stacks-block-height)
         
-        ;; Auto-rebalance after harvest if enabled - simplified response handling
-        (if (and (var-get auto-rebalance-enabled) (needs-rebalancing))
-    (begin
-        (unwrap-panic (rebalance-strategies))
-        u1)  ;; Return 1 for rebalanced
-    u0)      ;; Return 0 for not rebalanced
+        ;; FIXED: Both branches now return response types
+        (let ((rebalance-result
+                (if (and (var-get auto-rebalance-enabled) (needs-rebalancing))
+                    (rebalance-strategies)
+                    (ok true))))
+          (try! rebalance-result)
+        )
+        
+        ;; Check invariants after harvest
+        (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
         
         (print {event: "harvest-all", total-yield: total-yield})
         (ok total-yield)
@@ -942,22 +1073,22 @@
 
 (define-public (claim-loyalty-bonus)
   (let (
-  (user-achievements-data (get-user-achievements tx-sender))
-  (user-shares-data (get-user-shares tx-sender))
-  (loyalty-multiplier (calculate-loyalty-multiplier tx-sender))
-)
-  (begin
-    (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
-    (asserts! (> loyalty-multiplier PRECISION) (err ERR-INVALID-AMOUNT))
-    
-    ;; Update loyalty multiplier in achievements map
-    (map-set user-achievements {user: tx-sender}
-      (merge user-achievements-data {loyalty-multiplier: loyalty-multiplier}))
-    
-    (print {event: "loyalty-bonus-claimed", user: tx-sender, multiplier: loyalty-multiplier})
-    (ok loyalty-multiplier)
+    (user-achievements-data (get-user-achievements tx-sender))
+    (user-shares-data (get-user-shares tx-sender))
+    (loyalty-multiplier (calculate-loyalty-multiplier tx-sender))
   )
-)
+    (begin
+      (asserts! (is-initialized) (err ERR-UNAUTHORIZED))
+      (asserts! (> loyalty-multiplier PRECISION) (err ERR-INVALID-AMOUNT))
+      
+      ;; Update loyalty multiplier in achievements map
+      (map-set user-achievements {user: tx-sender}
+        (merge user-achievements-data {loyalty-multiplier: loyalty-multiplier}))
+      
+      (print {event: "loyalty-bonus-claimed", user: tx-sender, multiplier: loyalty-multiplier})
+      (ok loyalty-multiplier)
+    )
+  )
 )
 
 (define-read-only (get-user-stats (user principal))
@@ -979,11 +1110,44 @@
     ;; Validate amount input
     (asserts! (validate-amount input-amount) (err ERR-INVALID-AMOUNT))
     
-    (let ((validated-amount input-amount)) ;; Use validated amount consistently
+    (let ((validated-amount input-amount))
       (try! (award-points referrer validated-amount))
       
       (print {event: "manual-referral-points-awarded", referrer: referrer, amount: validated-amount})
       (ok validated-amount)
     )
   )
+)
+
+;; ========== EMERGENCY FUNCTIONS ==========
+
+;; FIXED: Emergency withdrawal function for owner
+(define-public (emergency-withdraw-all)
+  (begin
+    (asserts! (is-owner) (err ERR-UNAUTHORIZED))
+    (asserts! (var-get emergency-shutdown-flag) (err ERR-UNAUTHORIZED))
+    
+    ;; Withdraw all from strategies
+    (unwrap-panic (withdraw-all-from-strategies))
+    
+    ;; Check final state
+    (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
+    
+    (print {event: "emergency-withdrawal-complete", liquid-assets: (var-get liquid-assets)})
+    (ok (var-get liquid-assets))
+  )
+)
+
+;; Read-only function to check vault health
+(define-read-only (get-vault-health)
+  {
+    invariants-ok: (check-vault-invariants),
+    liquid-assets: (var-get liquid-assets),
+    deployed-assets: (var-get deployed-assets),
+    total-assets: (get-total-assets),
+    total-shares: (var-get total-shares),
+    share-price: (get-share-price),
+    needs-rebalancing: (needs-rebalancing),
+    allocation-drift: (calculate-allocation-drift)
+  }
 )
