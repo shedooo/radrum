@@ -847,7 +847,9 @@
       (asserts! (check-vault-invariants) (err ERR-INVARIANT-VIOLATION))
       
       ;; FIXED: Contract transfers STX to user
-      (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+      (let ((recipient tx-sender))
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender recipient)))
+      )
       
       (print {event: "withdrawal", user: tx-sender, amount: withdrawal-amount, shares: user-shares})
       (ok withdrawal-amount)
@@ -1148,6 +1150,4 @@
     total-shares: (var-get total-shares),
     share-price: (get-share-price),
     needs-rebalancing: (needs-rebalancing),
-    allocation-drift: (calculate-allocation-drift)
-  }
-)
+ 
